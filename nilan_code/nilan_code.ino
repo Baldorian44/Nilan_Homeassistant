@@ -23,12 +23,18 @@
   Join this Danish Facebook Page for inspiration :) https://www.facebook.com/groups/667765647316443/
 */
 
-#include <ArduinoJson.h>
+#define SERIAL       SERIAL_HARDWARE // SERIAL_SOFTWARE or SERIAL_HARDWARE
+#define SERIAL_SOFTWARE_RX D2 // only needed if SERIAL is SERIAL_SOFTWARE
+#define SERIAL_SOFTWARE_TX D1 // only needed if SERIAL is SERIAL_SOFTWARE
+
+#include <FS.h>          // this needs to be first, or it all crashes and burns...
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager (Very important when installing this version you will get an error, thus you need the development branch.. i downloaded the development branch from github and placed here: G:\Mit programmering\Arduino Programs\libraries
+#include <ArduinoJson.h> // https://github.com/bblanchon/ArduinoJson
 #include <ESP8266WiFi.h>
 #include <ArduinoOTA.h>
 #include <ModbusMaster.h>
 #include <PubSubClient.h>
-#include "configuration.h"
+#include <Ticker.h>
 #if SERIAL == SERIAL_SOFTWARE
 #include <SoftwareSerial.h>
 #endif
@@ -36,7 +42,7 @@
 #define SERIAL_SOFTWARE 1
 #define SERIAL_HARDWARE 2
 
-#define HOST "NilanGW-%s" // Change this to whatever you like. 
+#define HOST "NilanMQTTAdapter-%s" // Change this to whatever you like. 
 #define MAXREGSIZE 26
 #define SENDINTERVAL 60000 // normally set to 180000 milliseconds = 3 minutes. Define as you like
 #define VENTSET 1003
@@ -49,12 +55,7 @@
 SoftwareSerial SSerial(SERIAL_SOFTWARE_RX, SERIAL_SOFTWARE_TX); // RX, TX
 #endif
 
-const char* ssid = WIFISSID;
-const char* password = WIFIPASSWORD;
 char chipid[12];
-const char* mqttserver = MQTTSERVER;
-const char* mqttusername = MQTTUSERNAME;
-const char* mqttpassword = MQTTPASSWORD;
 WiFiServer server(80);
 WiFiClient client;
 PubSubClient mqttclient(client);
@@ -65,6 +66,23 @@ ModbusMaster node;
 int16_t AlarmListNumber[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,70,71,90,91,92};
 String AlarmListText[] = {"NONE","HARDWARE","TIMEOUT","FIRE","PRESSURE","DOOR","DEFROST","FROST","FROST","OVERTEMP","OVERHEAT","AIRFLOW","THERMO","BOILING","SENSOR","ROOM LOW","SOFTWARE","WATCHDOG","CONFIG","FILTER","LEGIONEL","POWER","T AIR","T WATER","T HEAT","MODEM","INSTABUS","T1SHORT","T1OPEN","T2SHORT","T2OPEN","T3SHORT","T3OPEN","T4SHORT","T4OPEN","T5SHORT","T5OPEN","T6SHORT","T6OPEN","T7SHORT","T7OPEN","T8SHORT","T8OPEN","T9SHORT","T9OPEN","T10SHORT","T10OPEN","T11SHORT","T11OPEN","T12SHORT","T12OPEN","T13SHORT","T13OPEN","T14SHORT","T14OPEN","T15SHORT","T15OPEN","T16SHORT","T16OPEN","ANODE","EXCH INFO","SLAVE IO","OPT IO","PRESET","INSTABUS"};
 
+char mqtt_server[40];
+char mqtt_port[6];
+char mqtt_user[40];
+char mqtt_pass[40];
+
+//default custom static IP
+char static_ip[16] = "10.0.1.56";
+char static_gw[16] = "10.0.1.1";
+char static_sn[16] = "255.255.255.0";
+
+//flag for saving data
+bool shouldSaveConfig = false;
+
+Ticker ticker;
+
+const int LEDPin_MQTT = 16; // D0
+const int LEDPin_WiFi = 15; // D8
 
 String req[4]; //operation, group, address, value
 enum reqtypes
@@ -139,6 +157,19 @@ char *getName(reqtypes type, int address)
     return regnames[type][address];
   }
   return NULL;
+}
+
+void tick()
+{
+  //toggle state
+  digitalWrite(26, !digitalRead(26));     // set pin to the opposite state
+}
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  //Serial.println("Should save config");
+  shouldSaveConfig = true;
+  ticker.attach(0.6, tick);
 }
 
 JsonObject HandleRequest(JsonDocument& doc)
@@ -219,21 +250,183 @@ JsonObject HandleRequest(JsonDocument& doc)
   return root;
 }
 
+void setupSpiffs()
+{
+  //clean FS, for testing
+  // SPIFFS.format();
+
+  //read configuration from FS json
+ // Serial.println("mounting FS...");
+
+  if (SPIFFS.begin()) {
+//    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+    //  Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+    //    Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonDocument json(1024);
+        auto deserializeError = deserializeJson(json, buf.get());
+        //json.printTo(Serial);
+        serializeJson(json, Serial);
+        //if (json.success()) {
+        if (!deserializeError)
+        {
+    //      Serial.println("\nparsed json");
+
+          strcpy(mqtt_server, json["mqtt_server"]);
+          strcpy(mqtt_port, json["mqtt_port"]);
+          strcpy(mqtt_user, json["mqtt_user"]);
+          strcpy(mqtt_pass, json["mqtt_pass"]);
+
+         
+
+        } else {
+     //     Serial.println("failed to load json config");
+        }
+      }
+    }
+  } else {
+ //   Serial.println("failed to mount FS");
+  }
+  //end read
+}
+
+void CheckWifiAndMQTTSettings()
+{
+  setupSpiffs();
+
+  //WiFiManager
+  //Local intialization. Once its business is done, there is no need to keep it around
+  WiFiManager wifiManager;
+  ticker.attach(0.2, tick);
+
+  //set config save notify callback
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  // The extra parameters to be configured (can be either global or just in the setup)
+  // After connecting, parameter.getValue() will get you the configured value
+  // id/name placeholder/prompt default length
+  WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 6);
+  WiFiManagerParameter custom_mqtt_user("user", "mqtt user", mqtt_user, 40);
+  WiFiManagerParameter custom_mqtt_pass("pass", "mqtt pass", mqtt_pass, 40);
+
+
+// Reset Wifi settings for testing  
+//  wifiManager.resetSettings();
+
+
+
+  //set static ip
+//  wifiManager.setSTAStaticIPConfig(IPAddress(10,0,1,99), IPAddress(10,0,1,1), IPAddress(255,255,255,0));
+  
+  //add all your parameters here
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_port);
+  wifiManager.addParameter(&custom_mqtt_user);
+  wifiManager.addParameter(&custom_mqtt_pass);
+
+  //reset settings - for testing
+  //wifiManager.resetSettings();
+
+  //set minimum quality of signal so it ignores AP's under that quality
+  //defaults to 8%
+  //wifiManager.setMinimumSignalQuality();
+  
+  //sets timeout until configuration portal gets turned off
+  //useful to make it all retry or go to sleep
+  //in seconds
+  //wifiManager.setTimeout(120);
+
+  //fetches ssid and pass and tries to connect
+  //if it does not connect it starts an access point with the specified name
+  //here  "AutoConnectAP"
+  //and goes into a blocking loop awaiting configuration
+  //  if (!wifiManager.autoConnect("WavinMQTTAdapter", "password")) {
+  if (!wifiManager.autoConnect("NilanMQTTAdapter")) {
+    //Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
+  }
+
+  //if you get here you have connected to the WiFi
+ // Serial.println("connected...yeey :)");
+  ticker.detach(); 
+  digitalWrite(26, 1);  
+  
+  digitalWrite(LEDPin_WiFi, LOW);
+
+  //read updated parameters
+  strcpy(mqtt_server, custom_mqtt_server.getValue());
+  strcpy(mqtt_port, custom_mqtt_port.getValue());
+  strcpy(mqtt_user, custom_mqtt_user.getValue());
+  strcpy(mqtt_pass, custom_mqtt_pass.getValue());
+ // strcpy(blynk_token, custom_blynk_token.getValue());
+
+  //save the custom parameters to FS
+  if (shouldSaveConfig) 
+  {
+ //   Serial.println("saving config");
+    DynamicJsonDocument json(1024);
+    //JsonObject json = jsonDocument.createObject();
+    json["mqtt_server"] = mqtt_server;
+    json["mqtt_port"]   = mqtt_port;
+    json["mqtt_user"]   = mqtt_user;
+    json["mqtt_pass"]   = mqtt_pass;
+
+    json["ip"]          = WiFi.localIP().toString();
+    json["gateway"]     = WiFi.gatewayIP().toString();
+    json["subnet"]      = WiFi.subnetMask().toString();
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+ //     Serial.println("failed to open config file for writing");
+    }
+
+    //json.printTo(Serial);
+    serializeJson(json, Serial);
+    //json.printTo(configFile);
+    serializeJson(json, configFile);
+    configFile.close();
+    //end save
+    shouldSaveConfig = false;
+  }
+}
+
 void setup()
 {
   char host[64];
   sprintf(chipid, "%08X", ESP.getChipId());
   sprintf(host, HOST, chipid);
   delay(500);
+
+   pinMode(LEDPin_WiFi, OUTPUT);
+   pinMode(LEDPin_MQTT, OUTPUT);
+
+   digitalWrite(LEDPin_WiFi, HIGH);
+   digitalWrite(LEDPin_MQTT, HIGH);
+
+  CheckWifiAndMQTTSettings();
+    
   WiFi.hostname(host);
   ArduinoOTA.setHostname(host);
-  WiFi.mode(WIFI_STA);
+  /*WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   while (WiFi.waitForConnectResult() != WL_CONNECTED)
   {
     delay(5000);
     ESP.restart();
   }
+  */
   ArduinoOTA.onStart([]() {
   });
   ArduinoOTA.onEnd([]() {
@@ -257,7 +450,9 @@ void setup()
     #error hardware og serial serial port?
   #endif
 
-  mqttclient.setServer(mqttserver, 1883);
+
+
+  mqttclient.setServer(mqtt_server, atoi(mqtt_port));
   mqttclient.setCallback(mqttcallback);
 }
 
@@ -390,7 +585,7 @@ void mqttreconnect()
   int numretries = 0;
   while (!mqttclient.connected() && numretries < 3)
   {
-    if (mqttclient.connect(chipid, mqttusername, mqttpassword))
+    if (mqttclient.connect(chipid, mqtt_user, mqtt_pass))
     {
       mqttclient.subscribe("ventilation/ventset");
       mqttclient.subscribe("ventilation/modeset");
@@ -412,6 +607,13 @@ void loop()
   // handle Telnet connection for debugging
   handleTelnet();
 #endif
+
+  if (WiFi.status() != WL_CONNECTED) 
+  {
+    digitalWrite(LEDPin_WiFi, HIGH);
+    WiFi.begin();
+    if (WiFi.waitForConnectResult() != WL_CONNECTED) return;
+  }
 
   ArduinoOTA.handle();
   WiFiClient client = server.available();
@@ -435,6 +637,7 @@ void loop()
 
   if (mqttclient.connected())
   {
+    digitalWrite(LEDPin_MQTT, LOW);
     mqttclient.loop();
     long now = millis();
     if (now - lastMsg > SENDINTERVAL)
@@ -450,6 +653,7 @@ void loop()
           for (int i = 0; i < regsizes[r]; i++)
           {
             char *name = getName(r, i);
+
             char numstr[10];
             if (name != NULL && strlen(name) > 0)
             {
@@ -602,5 +806,7 @@ void loop()
       }
       lastMsg = now;
     }
+  } else {
+      digitalWrite(LEDPin_MQTT, HIGH);
   }
 }

@@ -1,3 +1,10 @@
+# Credits
+This fantastic project is not developed by me. The project is forked from this : https://github.com/jascdk/Nilan_Homeassistant
+
+All the credits go to the originally owner "jascdk" and "DanGunvald". 
+I made some modifications to alarm log + added wifi manager and clean up the code to my liking.
+I've also added two LEDs high lighting when No WiFi is currently established, or if the MQTT protocol is not connected to the broker.
+
 # Make your Nilan Air ventilating system way more cool ;)
 
 This little cool project lets you use you Home Assistant to control and read values from your Nilan air vent system. I have the Nilan Comfort 300 combined with the CTS602 panel. It works great, but do not know if it is compatible with other models.
